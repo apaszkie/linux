@@ -2770,7 +2770,7 @@ void r5c_release_extra_page(struct stripe_head *sh)
 
 	if (using_disk_info_extra_page) {
 		clear_bit(R5C_EXTRA_PAGE_IN_USE, &conf->cache_state);
-		md_wakeup_thread(conf->mddev->thread);
+		raid5_wakeup_stripe_thread(sh);
 	}
 }
 
@@ -2825,7 +2825,7 @@ void r5c_finish_stripe_write_out(struct r5conf *conf,
 
 	if (test_and_clear_bit(STRIPE_FULL_WRITE, &sh->state))
 		if (atomic_dec_and_test(&conf->pending_full_writes))
-			md_wakeup_thread(conf->mddev->thread);
+			raid5_wakeup_stripe_thread(sh);
 
 	spin_lock_irq(&log->stripe_in_journal_lock);
 	list_del_init(&sh->r5c);

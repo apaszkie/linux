@@ -59,7 +59,6 @@
 #define UNSUPPORTED_MDDEV_FLAGS	(1L << MD_FAILFAST_SUPPORTED)
 
 #define cpu_to_group(cpu) cpu_to_node(cpu)
-#define ANY_GROUP NUMA_NO_NODE
 
 #define RAID5_MAX_REQ_STRIPES 256
 
@@ -132,26 +131,10 @@ static bool stripe_is_lowprio(struct stripe_head *sh)
 	       !test_bit(STRIPE_R5C_CACHING, &sh->state);
 }
 
-static void raid5_wakeup_stripe_thread(struct stripe_head *sh)
-	__must_hold(&sh->raid_conf->device_lock)
+void raid5_wakeup_stripe_thread(struct stripe_head *sh)
 {
 	struct r5conf *conf = sh->raid_conf;
 	struct r5worker *worker = conf->curr_worker;
-
-	if (++conf->curr_worker == &conf->workers[conf->worker_cnt])
-		conf->curr_worker = conf->workers;
-
-	if (list_empty(&sh->lru)) {
-		if (stripe_is_lowprio(sh))
-			list_add_tail(&sh->lru, &conf->loprio_list);
-		else
-			list_add_tail(&sh->lru, &conf->handle_list);
-	}
-
-	if (conf->worker_cnt == 0) {
-		md_wakeup_thread(conf->mddev->thread);
-		return;
-	}
 
 	queue_work(raid5_wq, &worker->work);
 }
@@ -189,24 +172,21 @@ static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh)
 		    !test_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
 			list_add_tail(&sh->lru, &conf->delayed_list);
 		else if (test_bit(STRIPE_BIT_DELAY, &sh->state) &&
-			   sh->bm_seq - conf->seq_write > 0)
+			   sh->bm_seq - conf->seq_write > 0) {
 			list_add_tail(&sh->lru, &conf->bitmap_list);
-		else {
+			md_wakeup_thread(conf->mddev->thread);
+			return;
+		} else {
 			clear_bit(STRIPE_DELAYED, &sh->state);
 			clear_bit(STRIPE_BIT_DELAY, &sh->state);
-			if (conf->worker_cnt == 0) {
-				if (stripe_is_lowprio(sh))
-					list_add_tail(&sh->lru,
-							&conf->loprio_list);
-				else
-					list_add_tail(&sh->lru,
-							&conf->handle_list);
-			} else {
-				raid5_wakeup_stripe_thread(sh);
-				return;
-			}
+			if (stripe_is_lowprio(sh))
+				list_add_tail(&sh->lru, &conf->loprio_list);
+			else
+				list_add_tail(&sh->lru, &conf->handle_list);
 		}
-		md_wakeup_thread(conf->mddev->thread);
+		raid5_wakeup_stripe_thread(sh);
+		if (++conf->curr_worker == &conf->workers[conf->worker_cnt])
+			conf->curr_worker = conf->workers;
 		return;
 	}
 
@@ -214,7 +194,7 @@ static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh)
 	if (test_and_clear_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
 		if (atomic_dec_return(&conf->preread_active_stripes)
 		    < IO_THRESHOLD)
-			md_wakeup_thread(conf->mddev->thread);
+			raid5_wakeup_stripe_thread(sh);
 	atomic_dec(&conf->active_stripes);
 
 	if (test_bit(STRIPE_EXPANDING, &sh->state))
@@ -298,7 +278,7 @@ void raid5_release_stripe(struct stripe_head *sh)
 		goto slow_path;
 	wakeup = llist_add(&sh->release_list, &conf->released_stripes);
 	if (wakeup)
-		md_wakeup_thread(conf->mddev->thread);
+		raid5_wakeup_stripe_thread(sh);
 	return;
 slow_path:
 	/* we are ok here if STRIPE_ON_RELEASE_LIST is set or not */
@@ -852,7 +832,7 @@ static void stripe_add_to_batch_list(struct r5conf *conf,
 	if (test_and_clear_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
 		if (atomic_dec_return(&conf->preread_active_stripes)
 		    < IO_THRESHOLD)
-			md_wakeup_thread(conf->mddev->thread);
+			raid5_wakeup_stripe_thread(sh);
 
 	if (test_and_clear_bit(STRIPE_BIT_DELAY, &sh->state)) {
 		int seq = sh->bm_seq;
@@ -3573,7 +3553,7 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 
 	if (test_and_clear_bit(STRIPE_FULL_WRITE, &sh->state))
 		if (atomic_dec_and_test(&conf->pending_full_writes))
-			md_wakeup_thread(conf->mddev->thread);
+			raid5_wakeup_stripe_thread(sh);
 }
 
 static void
@@ -3966,7 +3946,7 @@ unhash:
 
 	if (test_and_clear_bit(STRIPE_FULL_WRITE, &sh->state))
 		if (atomic_dec_and_test(&conf->pending_full_writes))
-			md_wakeup_thread(conf->mddev->thread);
+			raid5_wakeup_stripe_thread(sh);
 
 	if (head_sh->batch_head && do_endio)
 		break_stripe_batch_list(head_sh, STRIPE_EXPAND_SYNC_FLAGS);
@@ -5169,7 +5149,7 @@ finish:
 		atomic_dec(&conf->preread_active_stripes);
 		if (atomic_read(&conf->preread_active_stripes) <
 		    IO_THRESHOLD)
-			md_wakeup_thread(conf->mddev->thread);
+			raid5_wakeup_stripe_thread(sh);
 	}
 
 	clear_bit_unlock(STRIPE_ACTIVE, &sh->state);
@@ -5672,7 +5652,7 @@ static int add_all_stripe_bios(struct r5conf *conf,
 				raid5_release_stripe(ctx->batch_last);
 				ctx->batch_last = NULL;
 			}
-			md_wakeup_thread(conf->mddev->thread);
+			raid5_wakeup_stripe_thread(sh);
 			wait_on_bit(&dev->flags, R5_Overlap, TASK_UNINTERRUPTIBLE);
 			return 0;
 		}
@@ -5791,7 +5771,7 @@ static enum stripe_result make_stripe_request(struct mddev *mddev,
 	}
 
 	if (test_bit(STRIPE_EXPANDING, &sh->state)) {
-		md_wakeup_thread(mddev->thread);
+		raid5_wakeup_stripe_thread(sh);
 		ret = STRIPE_SCHEDULE_AND_RETRY;
 		goto out_release;
 	}
@@ -6492,6 +6472,10 @@ static void raid5_do_work(struct work_struct *work)
 		int batch_size, released;
 
 		released = release_stripe_list(conf);
+		if (released)
+			clear_bit(R5_DID_ALLOC, &conf->cache_state);
+
+		raid5_activate_delayed(conf);
 
 		batch_size = handle_active_stripes(conf, worker);
 		if (!batch_size && !released)
@@ -6504,6 +6488,16 @@ static void raid5_do_work(struct work_struct *work)
 	pr_debug("%d stripes handled\n", handled);
 
 	spin_unlock_irq(&conf->device_lock);
+
+	if (test_and_clear_bit(R5_ALLOC_MORE, &conf->cache_state) &&
+	    mutex_trylock(&conf->cache_size_mutex)) {
+		grow_one_stripe(conf, __GFP_NOWARN);
+		/* Set flag even if allocation failed.  This helps
+		 * slow down allocation requests when mem is short
+		 */
+		set_bit(R5_DID_ALLOC, &conf->cache_state);
+		mutex_unlock(&conf->cache_size_mutex);
+	}
 
 	flush_deferred_bios(conf);
 
@@ -6526,7 +6520,6 @@ static void raid5d(struct md_thread *thread)
 {
 	struct mddev *mddev = thread->mddev;
 	struct r5conf *conf = mddev->private;
-	int handled;
 	struct blk_plug plug;
 
 	pr_debug("+++ raid5d active\n");
@@ -6534,19 +6527,11 @@ static void raid5d(struct md_thread *thread)
 	md_check_recovery(mddev);
 
 	blk_start_plug(&plug);
-	handled = 0;
 	spin_lock_irq(&conf->device_lock);
-	while (1) {
+
+	if (!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags)) {
 		struct bio *bio;
-		int batch_size, released;
 		unsigned int offset;
-
-		if (test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
-			break;
-
-		released = release_stripe_list(conf);
-		if (released)
-			clear_bit(R5_DID_ALLOC, &conf->cache_state);
 
 		if (
 		    !list_empty(&conf->bitmap_list)) {
@@ -6558,7 +6543,6 @@ static void raid5d(struct md_thread *thread)
 			conf->seq_write = conf->seq_flush;
 			activate_bit_delay(conf);
 		}
-		raid5_activate_delayed(conf);
 
 		while ((bio = remove_bio_from_retry(conf, &offset))) {
 			int ok;
@@ -6567,32 +6551,9 @@ static void raid5d(struct md_thread *thread)
 			spin_lock_irq(&conf->device_lock);
 			if (!ok)
 				break;
-			handled++;
-		}
-
-		batch_size = handle_active_stripes(conf, NULL);
-		if (!batch_size && !released)
-			break;
-		handled += batch_size;
-
-		if (mddev->sb_flags & ~(1 << MD_SB_CHANGE_PENDING)) {
-			spin_unlock_irq(&conf->device_lock);
-			md_check_recovery(mddev);
-			spin_lock_irq(&conf->device_lock);
 		}
 	}
-	pr_debug("%d stripes handled\n", handled);
-
 	spin_unlock_irq(&conf->device_lock);
-	if (test_and_clear_bit(R5_ALLOC_MORE, &conf->cache_state) &&
-	    mutex_trylock(&conf->cache_size_mutex)) {
-		grow_one_stripe(conf, __GFP_NOWARN);
-		/* Set flag even if allocation failed.  This helps
-		 * slow down allocation requests when mem is short
-		 */
-		set_bit(R5_DID_ALLOC, &conf->cache_state);
-		mutex_unlock(&conf->cache_size_mutex);
-	}
 
 	flush_deferred_bios(conf);
 
@@ -6948,7 +6909,7 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 	if (kstrtouint(page, 10, &new))
 		return -EINVAL;
 	/* 8192 should be big enough */
-	if (new > 8192)
+	if (new == 0 || new > 8192)
 		return -EINVAL;
 
 	err = mddev_suspend_and_lock(mddev);
@@ -7004,10 +6965,6 @@ static int alloc_workers(struct r5conf *conf, int cnt,
 	int i;
 	struct r5worker *workers;
 
-	if (cnt == 0) {
-		*_workers = NULL;
-		return 0;
-	}
 
 	workers = kcalloc(cnt, sizeof(struct r5worker), GFP_NOIO);
 	if (!workers)
@@ -7239,9 +7196,8 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 		goto abort;
 	for (i = 0; i < PENDING_IO_MAX; i++)
 		list_add(&conf->pending_data[i].sibling, &conf->free_list);
-	/* Don't enable multi-threading by default*/
-	if (!alloc_workers(conf, 0, &new_workers)) {
-		conf->worker_cnt = 0;
+	if (!alloc_workers(conf, 1, &new_workers)) {
+		conf->worker_cnt = 1;
 		conf->workers = new_workers;
 		conf->curr_worker = conf->workers;
 	} else

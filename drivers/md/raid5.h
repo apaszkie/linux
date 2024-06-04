@@ -798,4 +798,5 @@ struct stripe_head *raid5_get_active_stripe(struct r5conf *conf,
 
 int raid5_calc_degraded(struct r5conf *conf);
 int r5c_journal_mode_set(struct mddev *mddev, int journal_mode);
+void raid5_wakeup_stripe_thread(struct stripe_head *sh);
 #endif
