@@ -38,7 +38,7 @@
 /* start flush with these full stripes */
 #define R5C_FULL_STRIPE_FLUSH_BATCH(conf) (conf->max_nr_stripes / 4)
 /* reclaim stripes in groups */
-#define R5C_RECLAIM_STRIPE_GROUP (NR_STRIPE_HASH_LOCKS * 2)
+#define R5C_RECLAIM_STRIPE_GROUP (16)
 
 /*
  * We only need 2 bios per I/O unit to make progress, but ensure we
@@ -339,12 +339,12 @@ void r5c_check_stripe_cache_usage(struct r5conf *conf)
 	 * The following condition is true for either of the following:
 	 *   - stripe cache pressure high:
 	 *          total_cached > 3/4 min_nr_stripes ||
-	 *          empty_inactive_list_nr > 0
+	 *          inactive_list empty
 	 *   - stripe cache pressure moderate:
 	 *          total_cached > 1/2 min_nr_stripes
 	 */
 	if (total_cached > conf->min_nr_stripes * 1 / 2 ||
-	    atomic_read(&conf->empty_inactive_list_nr) > 0)
+	    list_empty(&conf->inactive_list))
 		r5l_wake_reclaim(log, 0);
 }
 
@@ -1440,7 +1440,7 @@ static void r5c_do_reclaim(struct r5conf *conf)
 		flushing_full - flushing_partial;
 
 	if (total_cached > conf->min_nr_stripes * 3 / 4 ||
-	    atomic_read(&conf->empty_inactive_list_nr) > 0)
+	    list_empty(&conf->inactive_list))
 		/*
 		 * if stripe cache pressure high, flush all full stripes and
 		 * some partial stripes
