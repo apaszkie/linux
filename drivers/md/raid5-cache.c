@@ -406,7 +406,7 @@ static sector_t r5c_log_required_to_flush_cache(struct r5conf *conf)
 
 	return BLOCK_SECTORS *
 		((conf->max_degraded + 1) * atomic_read(&log->stripe_in_journal_count) +
-		 (conf->raid_disks - conf->max_degraded) * (conf->group_cnt + 1));
+		 (conf->raid_disks - conf->max_degraded) * 2);
 }
 
 /*

@@ -219,8 +219,6 @@ struct stripe_head {
 	enum check_states	check_state;
 	enum reconstruct_states reconstruct_state;
 	spinlock_t		stripe_lock;
-	int			cpu;
-	struct r5worker_group	*group;
 
 	struct stripe_head	*batch_head; /* protected by stripe lock */
 	spinlock_t		batch_lock; /* only header's lock is useful */
@@ -497,16 +495,7 @@ struct disk_info {
 
 struct r5worker {
 	struct work_struct work;
-	struct r5worker_group *group;
-	bool working;
-};
-
-struct r5worker_group {
-	struct list_head handle_list;
-	struct list_head loprio_list;
 	struct r5conf *conf;
-	struct r5worker *workers;
-	int stripes_cnt;
 };
 
 /*
@@ -667,9 +656,9 @@ struct r5conf {
 	 * the new thread here until we fully activate the array.
 	 */
 	struct md_thread __rcu	*thread;
-	struct r5worker_group	*worker_groups;
-	int			group_cnt;
-	int			worker_cnt_per_group;
+	struct r5worker		*workers;
+	struct r5worker		*curr_worker;
+	int			worker_cnt;
 	struct r5l_log		*log;
 	void			*log_private;
 
