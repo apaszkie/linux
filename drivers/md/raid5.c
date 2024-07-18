@@ -230,40 +230,41 @@ static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh)
 			}
 		}
 		md_wakeup_thread(conf->mddev->thread);
-	} else {
-		BUG_ON(stripe_operations_active(sh));
-		if (test_and_clear_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
-			if (atomic_dec_return(&conf->preread_active_stripes)
-			    < IO_THRESHOLD)
-				md_wakeup_thread(conf->mddev->thread);
-		atomic_dec(&conf->active_stripes);
-		if (!test_bit(STRIPE_EXPANDING, &sh->state)) {
-			if (!r5c_is_writeback(conf->log))
-				goto inactive;
-			else {
-				WARN_ON(test_bit(R5_InJournal, &sh->dev[sh->pd_idx].flags));
-				if (injournal == 0)
-					goto inactive;
-				else if (injournal == conf->raid_disks - conf->max_degraded) {
-					/* full stripe */
-					if (!test_and_set_bit(STRIPE_R5C_FULL_STRIPE, &sh->state))
-						atomic_inc(&conf->r5c_cached_full_stripes);
-					if (test_and_clear_bit(STRIPE_R5C_PARTIAL_STRIPE, &sh->state))
-						atomic_dec(&conf->r5c_cached_partial_stripes);
-					list_add_tail(&sh->lru, &conf->r5c_full_stripe_list);
-					r5c_check_cached_full_stripe(conf);
-				} else
-					/*
-					 * STRIPE_R5C_PARTIAL_STRIPE is set in
-					 * r5c_try_caching_write(). No need to
-					 * set it again.
-					 */
-					list_add_tail(&sh->lru, &conf->r5c_partial_stripe_list);
-			}
+		return;
+	}
+
+	BUG_ON(stripe_operations_active(sh));
+	if (test_and_clear_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+		if (atomic_dec_return(&conf->preread_active_stripes)
+		    < IO_THRESHOLD)
+			md_wakeup_thread(conf->mddev->thread);
+	atomic_dec(&conf->active_stripes);
+
+	if (test_bit(STRIPE_EXPANDING, &sh->state))
+		return;
+
+	if (r5c_is_writeback(conf->log)) {
+		WARN_ON(test_bit(R5_InJournal, &sh->dev[sh->pd_idx].flags));
+		if (injournal != 0) {
+			if (injournal == conf->raid_disks - conf->max_degraded) {
+				/* full stripe */
+				if (!test_and_set_bit(STRIPE_R5C_FULL_STRIPE, &sh->state))
+					atomic_inc(&conf->r5c_cached_full_stripes);
+				if (test_and_clear_bit(STRIPE_R5C_PARTIAL_STRIPE, &sh->state))
+					atomic_dec(&conf->r5c_cached_partial_stripes);
+				list_add_tail(&sh->lru, &conf->r5c_full_stripe_list);
+				r5c_check_cached_full_stripe(conf);
+			} else
+				/*
+				 * STRIPE_R5C_PARTIAL_STRIPE is set in
+				 * r5c_try_caching_write(). No need to
+				 * set it again.
+				 */
+				list_add_tail(&sh->lru, &conf->r5c_partial_stripe_list);
+			return;
 		}
 	}
-	return;
-inactive:
+
 	list_add_tail(&sh->lru, &conf->inactive_list);
 	wake_up(&conf->wait_for_stripe);
 	if (atomic_read(&conf->active_stripes) == 0)
