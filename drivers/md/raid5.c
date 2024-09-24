@@ -66,7 +66,6 @@ static bool devices_handle_discard_safely = false;
 module_param(devices_handle_discard_safely, bool, 0644);
 MODULE_PARM_DESC(devices_handle_discard_safely,
 		 "Set to Y if all devices in each array reliably return zeroes on reads from discarded regions");
-static struct workqueue_struct *raid5_wq;
 
 static void raid5_quiesce(struct mddev *mddev, int quiesce);
 
@@ -133,7 +132,7 @@ static bool stripe_is_lowprio(struct stripe_head *sh)
 
 void raid5_wakeup_stripe_thread(struct stripe_head *sh)
 {
-	queue_work(raid5_wq, &sh->worker->work);
+	md_wakeup_thread(sh->worker->thread);
 }
 
 static void do_release_stripe(struct r5worker *worker, struct stripe_head *sh)
@@ -6504,9 +6503,9 @@ static int handle_active_stripes(struct r5conf *conf, struct r5worker *worker)
 	return batch_size;
 }
 
-static void raid5_do_work(struct work_struct *work)
+static void raid5_do_work(struct md_thread *thread)
 {
-	struct r5worker *worker = container_of(work, struct r5worker, work);
+	struct r5worker *worker = thread->private;
 	struct r5conf *conf = worker->conf;
 	struct mddev *mddev = conf->mddev;
 	int handled;
@@ -6983,10 +6982,8 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 	conf = mddev->private;
 	if (!conf)
 		err = -ENODEV;
-	else if (new != conf->worker_cnt) {
-		flush_workqueue(raid5_wq);
+	else if (new != conf->worker_cnt)
 		err = change_workers(conf, new);
-	}
 	mddev_unlock_and_resume(mddev);
 
 	return err ?: len;
@@ -7019,7 +7016,10 @@ static void free_workers(struct r5worker *workers, int cnt)
 	int i;
 
 	for (i = 0; i < cnt; i++) {
-		kfree(workers[i].stripe_hashtbl);
+		struct r5worker *worker = &workers[i];
+
+		md_unregister_thread(worker->conf->mddev, &worker->thread);
+		kfree(worker->stripe_hashtbl);
 	}
 	kfree(workers);
 }
@@ -7029,6 +7029,7 @@ static int alloc_workers(struct r5conf *conf, int cnt,
 {
 	int i;
 	struct r5worker *workers;
+	char thread_name[17];
 
 	workers = kcalloc(cnt, sizeof(struct r5worker), GFP_KERNEL);
 	if (!workers)
@@ -7036,12 +7037,23 @@ static int alloc_workers(struct r5conf *conf, int cnt,
 
 	for (i = 0; i < cnt; i++) {
 		struct r5worker *worker = &workers[i];
+		struct md_thread *thread;
+
 		worker->stripe_hashtbl = kzalloc(PAGE_SIZE, GFP_KERNEL);
 		if (!worker->stripe_hashtbl)
 			goto err;
 
+		snprintf(thread_name, sizeof(thread_name), "worker%d", i);
+		thread = md_register_thread(raid5_do_work, conf->mddev,
+					    thread_name);
+		if (!thread) {
+			kfree(worker->stripe_hashtbl);
+			goto err;
+		}
+		thread->private = worker;
+		rcu_assign_pointer(worker->thread, thread);
+
 		worker->conf = conf;
-		INIT_WORK(&worker->work, raid5_do_work);
 		spin_lock_init(&worker->lock);
 		init_waitqueue_head(&worker->wait_for_stripe);
 		INIT_LIST_HEAD(&worker->handle_list);
@@ -7345,6 +7357,8 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	if (conf == NULL)
 		goto abort;
 
+	conf->mddev = mddev;
+
 #if PAGE_SIZE != DEFAULT_STRIPE_SIZE
 	conf->stripe_size = DEFAULT_STRIPE_SIZE;
 	conf->stripe_shift = ilog2(DEFAULT_STRIPE_SIZE) - 9;
@@ -7409,7 +7423,6 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	ret = bioset_init(&conf->bio_split, BIO_POOL_SIZE, 0, 0);
 	if (ret)
 		goto abort;
-	conf->mddev = mddev;
 
 	ret = -ENOMEM;
 
@@ -8876,17 +8889,11 @@ static int __init raid5_init(void)
 {
 	int ret;
 
-	raid5_wq = alloc_workqueue("raid5wq",
-		WQ_UNBOUND|WQ_MEM_RECLAIM|WQ_CPU_INTENSIVE|WQ_SYSFS, 0);
-	if (!raid5_wq)
-		return -ENOMEM;
-
 	ret = cpuhp_setup_state_multi(CPUHP_MD_RAID5_PREPARE,
 				      "md/raid5:prepare",
 				      raid456_cpu_up_prepare,
 				      raid456_cpu_dead);
 	if (ret) {
-		destroy_workqueue(raid5_wq);
 		return ret;
 	}
 	register_md_personality(&raid6_personality);
@@ -8901,7 +8908,6 @@ static void raid5_exit(void)
 	unregister_md_personality(&raid5_personality);
 	unregister_md_personality(&raid4_personality);
 	cpuhp_remove_multi_state(CPUHP_MD_RAID5_PREPARE);
-	destroy_workqueue(raid5_wq);
 }
 
 module_init(raid5_init);

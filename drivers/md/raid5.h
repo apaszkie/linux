@@ -495,7 +495,7 @@ struct disk_info {
 #define MAX_STRIPE_BATCH	8
 
 struct r5worker {
-	struct work_struct	work;
+	struct md_thread __rcu	*thread;
 	struct r5conf		*conf;
 	int			max_nr_stripes;
 	spinlock_t		lock;
