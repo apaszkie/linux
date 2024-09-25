@@ -522,6 +522,9 @@ enum r5_cache_state {
 				 * released.  This avoids flooding
 				 * the cache.
 				 */
+};
+
+enum r5c_cache_state {
 	R5C_LOG_TIGHT,		/* log device space tight, need to
 				 * prioritize stripes at last_checkpoint
 				 */
@@ -648,6 +651,7 @@ struct r5conf {
 	wait_queue_head_t	wait_for_quiescent;
 	wait_queue_head_t	wait_for_stripe;
 	wait_queue_head_t	wait_for_reshape;
+	unsigned long		worker_cache_state;
 	unsigned long		cache_state;
 	struct shrinker		*shrinker;
 	int			pool_size; /* number of disks in stripeheads in pool */

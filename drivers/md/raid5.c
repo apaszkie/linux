@@ -637,7 +637,7 @@ static bool is_inactive_blocked(struct r5conf *conf)
 	if (list_empty(&conf->inactive_list))
 		return false;
 
-	if (!test_bit(R5_INACTIVE_BLOCKED, &conf->cache_state))
+	if (!test_bit(R5_INACTIVE_BLOCKED, &conf->worker_cache_state))
 		return true;
 
 	return (atomic_read(&conf->active_stripes) <
@@ -678,7 +678,7 @@ struct stripe_head *raid5_get_active_stripe(struct r5conf *conf,
 		if (sh)
 			break;
 
-		if (!test_bit(R5_INACTIVE_BLOCKED, &conf->cache_state)) {
+		if (!test_bit(R5_INACTIVE_BLOCKED, &conf->worker_cache_state)) {
 			sh = get_free_stripe(conf);
 			if (sh) {
 				r5c_check_stripe_cache_usage(conf);
@@ -687,14 +687,14 @@ struct stripe_head *raid5_get_active_stripe(struct r5conf *conf,
 				break;
 			}
 
-			if (!test_bit(R5_DID_ALLOC, &conf->cache_state))
-				set_bit(R5_ALLOC_MORE, &conf->cache_state);
+			if (!test_bit(R5_DID_ALLOC, &conf->worker_cache_state))
+				set_bit(R5_ALLOC_MORE, &conf->worker_cache_state);
 		}
 
 		if (flags & R5_GAS_NOBLOCK)
 			break;
 
-		set_bit(R5_INACTIVE_BLOCKED, &conf->cache_state);
+		set_bit(R5_INACTIVE_BLOCKED, &conf->worker_cache_state);
 		r5l_wake_reclaim(conf->log, 0);
 
 		/* release batch_last before wait to avoid risk of deadlock */
@@ -706,7 +706,7 @@ struct stripe_head *raid5_get_active_stripe(struct r5conf *conf,
 		wait_event_lock_irq(conf->wait_for_stripe,
 				    is_inactive_blocked(conf),
 				    conf->device_lock);
-		clear_bit(R5_INACTIVE_BLOCKED, &conf->cache_state);
+		clear_bit(R5_INACTIVE_BLOCKED, &conf->worker_cache_state);
 	}
 
 	spin_unlock_irq(&conf->device_lock);
@@ -6491,7 +6491,7 @@ static void raid5_do_work(struct work_struct *work)
 
 		released = release_stripe_list(conf);
 		if (released)
-			clear_bit(R5_DID_ALLOC, &conf->cache_state);
+			clear_bit(R5_DID_ALLOC, &conf->worker_cache_state);
 
 		raid5_activate_delayed(conf);
 
@@ -6507,13 +6507,13 @@ static void raid5_do_work(struct work_struct *work)
 
 	spin_unlock_irq(&conf->device_lock);
 
-	if (test_and_clear_bit(R5_ALLOC_MORE, &conf->cache_state) &&
+	if (test_and_clear_bit(R5_ALLOC_MORE, &conf->worker_cache_state) &&
 	    mutex_trylock(&conf->cache_size_mutex)) {
 		grow_one_stripe(worker, __GFP_NOWARN);
 		/* Set flag even if allocation failed.  This helps
 		 * slow down allocation requests when mem is short
 		 */
-		set_bit(R5_DID_ALLOC, &conf->cache_state);
+		set_bit(R5_DID_ALLOC, &conf->worker_cache_state);
 		mutex_unlock(&conf->cache_size_mutex);
 	}
 
