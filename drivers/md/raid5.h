@@ -498,6 +498,26 @@ struct r5worker {
 	struct work_struct	work;
 	struct r5conf		*conf;
 	int			max_nr_stripes;
+	spinlock_t		lock;
+	struct hlist_head	*stripe_hashtbl;
+	struct list_head	handle_list;
+	struct list_head	loprio_list;
+	struct list_head	hold_list; /* preread ready stripes */
+	struct list_head	delayed_list; /* stripes that have plugged requests */
+	atomic_t		preread_active_stripes; /* stripes with scheduled io */
+	atomic_t		pending_full_writes; /* full write backlog */
+	int			bypass_count; /* bypassed prereads */
+	struct list_head	*last_hold; /* detect hold_list promotions */
+
+	/*
+	 * Free stripes pool
+	 */
+	atomic_t		active_stripes;
+	struct list_head	inactive_list;
+
+	struct llist_head	released_stripes;
+	wait_queue_head_t	wait_for_stripe;
+	unsigned long		cache_state;
 };
 
 /*
@@ -556,7 +576,6 @@ struct raid5_percpu {
 };
 
 struct r5conf {
-	struct hlist_head	*stripe_hashtbl;
 	struct mddev		*mddev;
 	int			chunk_sectors;
 	int			level, algorithm, rmw_level;
@@ -595,21 +614,13 @@ struct r5conf {
 						  * but is closest to zero.
 						  */
 
-	struct list_head	handle_list; /* stripes needing handling */
-	struct list_head	loprio_list; /* low priority stripes */
-	struct list_head	hold_list; /* preread ready stripes */
-	struct list_head	delayed_list; /* stripes that have plugged requests */
 	struct list_head	bitmap_list; /* stripes delaying awaiting bitmap update */
 	struct bio		*retry_read_aligned; /* currently retrying aligned bios   */
 	unsigned int		retry_read_offset; /* sector offset into retry_read_aligned */
 	struct bio		*retry_read_aligned_list; /* aligned bios retry list  */
-	atomic_t		preread_active_stripes; /* stripes with scheduled io */
 	atomic_t		active_aligned_reads;
-	atomic_t		pending_full_writes; /* full write backlog */
-	int			bypass_count; /* bypassed prereads */
 	int			bypass_threshold; /* preread nice */
 	int			skip_copy; /* Don't copy data from bio to stripe cache */
-	struct list_head	*last_hold; /* detect hold_list promotions */
 
 	atomic_t		reshape_stripes; /* stripes with pending writes for reshape */
 	/* unfortunately we need two cache names as we temporarily have
@@ -634,11 +645,7 @@ struct r5conf {
 	int scribble_sectors;
 	struct hlist_node node;
 
-	/*
-	 * Free stripes pool
-	 */
 	atomic_t		active_stripes;
-	struct list_head	inactive_list;
 
 	atomic_t		r5c_cached_full_stripes;
 	struct list_head	r5c_full_stripe_list;
@@ -647,11 +654,8 @@ struct r5conf {
 	atomic_t		r5c_flushing_full_stripes;
 	atomic_t		r5c_flushing_partial_stripes;
 
-	struct llist_head	released_stripes;
 	wait_queue_head_t	wait_for_quiescent;
-	wait_queue_head_t	wait_for_stripe;
 	wait_queue_head_t	wait_for_reshape;
-	unsigned long		worker_cache_state;
 	unsigned long		cache_state;
 	struct shrinker		*shrinker;
 	int			pool_size; /* number of disks in stripeheads in pool */

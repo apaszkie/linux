@@ -324,8 +324,9 @@ void r5c_handle_cached_data_endio(struct r5conf *conf,
 void r5l_wake_reclaim(struct r5l_log *log, sector_t space);
 
 /* Check whether we should flush some stripes to free up stripe cache */
-void r5c_check_stripe_cache_usage(struct r5conf *conf)
+void r5c_check_stripe_cache_usage(struct r5worker *worker)
 {
+	struct r5conf *conf = worker->conf;
 	int total_cached;
 	struct r5l_log *log = READ_ONCE(conf->log);
 
@@ -344,7 +345,7 @@ void r5c_check_stripe_cache_usage(struct r5conf *conf)
 	 *          total_cached > 1/2 min_nr_stripes
 	 */
 	if (total_cached > conf->min_nr_stripes * 1 / 2 ||
-	    list_empty(&conf->inactive_list))
+	    list_empty(&worker->inactive_list))
 		r5l_wake_reclaim(log, 0);
 }
 
@@ -460,7 +461,7 @@ void r5c_make_stripe_write_out(struct stripe_head *sh)
 	clear_bit(STRIPE_R5C_CACHING, &sh->state);
 
 	if (!test_and_set_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
-		atomic_inc(&conf->preread_active_stripes);
+		atomic_inc(&sh->worker->preread_active_stripes);
 }
 
 static void r5c_handle_data_cached(struct stripe_head *sh)
@@ -1380,6 +1381,7 @@ static void r5c_flush_stripe(struct r5conf *conf, struct stripe_head *sh)
 
 	set_bit(STRIPE_HANDLE, &sh->state);
 	atomic_inc(&conf->active_stripes);
+	atomic_inc(&sh->worker->active_stripes);
 	r5c_make_stripe_write_out(sh);
 
 	if (test_bit(STRIPE_R5C_PARTIAL_STRIPE, &sh->state))
@@ -1429,6 +1431,7 @@ static void r5c_do_reclaim(struct r5conf *conf)
 	int total_cached;
 	int stripes_to_flush;
 	int flushing_partial, flushing_full;
+	bool flush_all = false;
 
 	if (!r5c_is_writeback(log))
 		return;
@@ -1439,8 +1442,22 @@ static void r5c_do_reclaim(struct r5conf *conf)
 		atomic_read(&conf->r5c_cached_full_stripes) -
 		flushing_full - flushing_partial;
 
-	if (total_cached > conf->min_nr_stripes * 3 / 4 ||
-	    list_empty(&conf->inactive_list))
+	if (total_cached > conf->min_nr_stripes * 3 / 4) {
+		flush_all = true;
+	} else {
+		int i;
+
+		spin_lock_irqsave(&conf->device_lock, flags);
+		for (i = 0; i < conf->worker_cnt; i++) {
+			if (list_empty(&conf->workers[i].inactive_list)) {
+				flush_all = true;
+				break;
+			}
+		}
+		spin_unlock_irqrestore(&conf->device_lock, flags);
+	}
+
+	if (flush_all)
 		/*
 		 * if stripe cache pressure high, flush all full stripes and
 		 * some partial stripes
@@ -2824,7 +2841,7 @@ void r5c_finish_stripe_write_out(struct r5conf *conf,
 	s->injournal = 0;
 
 	if (test_and_clear_bit(STRIPE_FULL_WRITE, &sh->state))
-		if (atomic_dec_and_test(&conf->pending_full_writes))
+		if (atomic_dec_and_test(&sh->worker->pending_full_writes))
 			raid5_wakeup_stripe_thread(sh);
 
 	spin_lock_irq(&log->stripe_in_journal_lock);

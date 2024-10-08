@@ -24,7 +24,7 @@ void r5c_handle_cached_data_endio(struct r5conf *conf,
 int r5c_cache_data(struct r5l_log *log, struct stripe_head *sh);
 void r5c_make_stripe_write_out(struct stripe_head *sh);
 void r5c_flush_cache(struct r5conf *conf, int num);
-void r5c_check_stripe_cache_usage(struct r5conf *conf);
+void r5c_check_stripe_cache_usage(struct r5worker *worker);
 void r5c_check_cached_full_stripe(struct r5conf *conf);
 extern struct md_sysfs_entry r5c_journal_mode;
 void r5c_update_on_rdev_error(struct mddev *mddev, struct md_rdev *rdev);
