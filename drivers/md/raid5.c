@@ -133,10 +133,7 @@ static bool stripe_is_lowprio(struct stripe_head *sh)
 
 void raid5_wakeup_stripe_thread(struct stripe_head *sh)
 {
-	struct r5conf *conf = sh->raid_conf;
-	struct r5worker *worker = conf->curr_worker;
-
-	queue_work(raid5_wq, &worker->work);
+	queue_work(raid5_wq, &sh->worker->work);
 }
 
 static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh)
@@ -185,8 +182,6 @@ static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh)
 				list_add_tail(&sh->lru, &conf->handle_list);
 		}
 		raid5_wakeup_stripe_thread(sh);
-		if (++conf->curr_worker == &conf->workers[conf->worker_cnt])
-			conf->curr_worker = conf->workers;
 		return;
 	}
 
@@ -2230,13 +2225,16 @@ static struct stripe_head *alloc_stripe(struct kmem_cache *sc, gfp_t gfp,
 	}
 	return sh;
 }
-static int grow_one_stripe(struct r5conf *conf, gfp_t gfp)
+static int grow_one_stripe(struct r5worker *worker, gfp_t gfp)
 {
+	struct r5conf *conf = worker->conf;
 	struct stripe_head *sh;
 
 	sh = alloc_stripe(conf->slab_cache, gfp, conf->pool_size, conf);
 	if (!sh)
 		return 0;
+
+	sh->worker = worker;
 
 	if (grow_buffers(sh, gfp)) {
 		shrink_buffers(sh);
@@ -2248,14 +2246,16 @@ static int grow_one_stripe(struct r5conf *conf, gfp_t gfp)
 
 	raid5_release_stripe(sh);
 	WRITE_ONCE(conf->max_nr_stripes, conf->max_nr_stripes + 1);
+	worker->max_nr_stripes++;
 	return 1;
 }
 
-static int grow_stripes(struct r5conf *conf, int num)
+static int grow_stripes(struct r5conf *conf)
 {
 	struct kmem_cache *sc;
 	size_t namelen = sizeof(conf->cache_name[0]);
 	int devs = max(conf->raid_disks, conf->previous_raid_disks);
+	int i;
 
 	if (mddev_is_dm(conf->mddev))
 		snprintf(conf->cache_name[0], namelen,
@@ -2273,9 +2273,13 @@ static int grow_stripes(struct r5conf *conf, int num)
 		return 1;
 	conf->slab_cache = sc;
 	conf->pool_size = devs;
-	while (num--)
-		if (!grow_one_stripe(conf, GFP_KERNEL))
-			return 1;
+
+	for (i = 0; i < conf->worker_cnt; i++) {
+		int n = conf->worker_min_nr_stripes;
+		while (n--)
+			if (!grow_one_stripe(&conf->workers[i], GFP_KERNEL))
+				return 1;
+	}
 
 	return 0;
 }
@@ -2384,7 +2388,8 @@ static int resize_stripes(struct r5conf *conf, int newsize)
 	struct disk_info *ndisks;
 	int err = 0;
 	struct kmem_cache *sc;
-	int i;
+	struct r5worker *worker;
+	int i, n = 0;
 
 	md_allow_write(conf->mddev);
 
@@ -2420,6 +2425,7 @@ static int resize_stripes(struct r5conf *conf, int newsize)
 	 * OK, we have enough stripes, start collecting inactive
 	 * stripes and copying them over
 	 */
+	worker = conf->workers;
 	list_for_each_entry(nsh, &newstripes, lru) {
 		spin_lock_irq(&conf->device_lock);
 		wait_event_lock_irq(conf->wait_for_stripe,
@@ -2440,6 +2446,12 @@ static int resize_stripes(struct r5conf *conf, int newsize)
 			nsh->dev[i].offset = osh->dev[i].offset;
 		}
 		free_stripe(conf->slab_cache, osh);
+
+		nsh->worker = worker;
+		if (++n == worker->max_nr_stripes) {
+			worker++;
+			n = 0;
+		}
 	}
 	kmem_cache_destroy(conf->slab_cache);
 
@@ -2517,8 +2529,9 @@ static int resize_stripes(struct r5conf *conf, int newsize)
 	return err;
 }
 
-static int drop_one_stripe(struct r5conf *conf)
+static int drop_one_stripe(struct r5worker *worker)
 {
+	struct r5conf *conf = worker->conf;
 	struct stripe_head *sh;
 
 	spin_lock_irq(&conf->device_lock);
@@ -2531,14 +2544,19 @@ static int drop_one_stripe(struct r5conf *conf)
 	free_stripe(conf->slab_cache, sh);
 	atomic_dec(&conf->active_stripes);
 	WRITE_ONCE(conf->max_nr_stripes, conf->max_nr_stripes - 1);
+	worker->max_nr_stripes--;
 	return 1;
 }
 
 static void shrink_stripes(struct r5conf *conf)
 {
-	while (conf->max_nr_stripes &&
-	       drop_one_stripe(conf))
-		;
+	int i;
+
+	for (i = 0; i < conf->worker_cnt; i++) {
+		while (conf->max_nr_stripes &&
+		       drop_one_stripe(&conf->workers[i]))
+			;
+	}
 
 	kmem_cache_destroy(conf->slab_cache);
 	conf->slab_cache = NULL;
@@ -6491,7 +6509,7 @@ static void raid5_do_work(struct work_struct *work)
 
 	if (test_and_clear_bit(R5_ALLOC_MORE, &conf->cache_state) &&
 	    mutex_trylock(&conf->cache_size_mutex)) {
-		grow_one_stripe(conf, __GFP_NOWARN);
+		grow_one_stripe(worker, __GFP_NOWARN);
 		/* Set flag even if allocation failed.  This helps
 		 * slow down allocation requests when mem is short
 		 */
@@ -6583,26 +6601,45 @@ raid5_set_cache_size(struct mddev *mddev, int size)
 {
 	int result = 0;
 	struct r5conf *conf = mddev->private;
+	struct r5worker *worker;
+	int i;
 
+	size = DIV_ROUND_UP(size, conf->worker_cnt);
 	if (size <= 16 || size > 32768)
 		return -EINVAL;
 
-	WRITE_ONCE(conf->min_nr_stripes, size);
 	mutex_lock(&conf->cache_size_mutex);
-	while (size < conf->max_nr_stripes &&
-	       drop_one_stripe(conf))
-		;
+	conf->worker_min_nr_stripes = size;
+	WRITE_ONCE(conf->min_nr_stripes, size * conf->worker_cnt);
+
+	for (i = 0; i < conf->worker_cnt; i++) {
+		worker = &conf->workers[i];
+
+		while (conf->worker_min_nr_stripes < worker->max_nr_stripes &&
+		       drop_one_stripe(worker))
+			;
+	}
 	mutex_unlock(&conf->cache_size_mutex);
 
 	md_allow_write(mddev);
 
 	mutex_lock(&conf->cache_size_mutex);
-	while (size > conf->max_nr_stripes)
-		if (!grow_one_stripe(conf, GFP_KERNEL)) {
-			WRITE_ONCE(conf->min_nr_stripes, conf->max_nr_stripes);
-			result = -ENOMEM;
-			break;
-		}
+	for (i = 0; i < conf->worker_cnt; i++) {
+		worker = &conf->workers[i];
+
+		while (conf->worker_min_nr_stripes > worker->max_nr_stripes)
+			if (!grow_one_stripe(worker, GFP_KERNEL)) {
+				for (; i < conf->worker_cnt; i++)
+					conf->worker_min_nr_stripes =
+						min(conf->worker_min_nr_stripes,
+						    conf->workers[i].max_nr_stripes);
+				WRITE_ONCE(conf->min_nr_stripes,
+					   conf->worker_min_nr_stripes * conf->worker_cnt);
+				result = -ENOMEM;
+				goto out;
+			}
+	}
+out:
 	mutex_unlock(&conf->cache_size_mutex);
 
 	return result;
@@ -6701,7 +6738,6 @@ raid5_store_stripe_size(struct mddev  *mddev, const char *page, size_t len)
 	struct r5conf *conf;
 	unsigned long new;
 	int err;
-	int size;
 
 	if (len >= PAGE_SIZE)
 		return -EINVAL;
@@ -6741,14 +6777,13 @@ raid5_store_stripe_size(struct mddev  *mddev, const char *page, size_t len)
 	}
 
 	mutex_lock(&conf->cache_size_mutex);
-	size = conf->max_nr_stripes;
 
 	shrink_stripes(conf);
 
 	conf->stripe_size = new;
 	conf->stripe_shift = ilog2(new) - 9;
 	conf->stripe_sectors = new >> 9;
-	if (grow_stripes(conf, size)) {
+	if (grow_stripes(conf)) {
 		pr_warn("md/raid:%s: couldn't allocate buffers\n",
 				mdname(mddev));
 		err = -ENOMEM;
@@ -6894,15 +6929,14 @@ raid5_show_group_thread_cnt(struct mddev *mddev, char *page)
 	return ret;
 }
 
-static int alloc_workers(struct r5conf *conf, int cnt,
-			 struct r5worker **_workers);
+static int change_workers(struct r5conf *conf, int new_cnt);
+
 static ssize_t
 raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 {
 	struct r5conf *conf;
 	unsigned int new;
 	int err;
-	struct r5worker *new_workers, *old_workers;
 
 	if (len >= PAGE_SIZE)
 		return -EINVAL;
@@ -6920,17 +6954,7 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 		err = -ENODEV;
 	else if (new != conf->worker_cnt) {
 		flush_workqueue(raid5_wq);
-		old_workers = conf->workers;
-
-		err = alloc_workers(conf, new, &new_workers);
-		if (!err) {
-			spin_lock_irq(&conf->device_lock);
-			conf->worker_cnt = new;
-			conf->workers = new_workers;
-			conf->curr_worker = conf->workers;
-			spin_unlock_irq(&conf->device_lock);
-			kfree(old_workers);
-		}
+		err = change_workers(conf, new);
 	}
 	mddev_unlock_and_resume(mddev);
 
@@ -6988,6 +7012,89 @@ static void free_workers(struct r5conf *conf)
 		kfree(conf->workers);
 		conf->workers = NULL;
 	}
+}
+
+static int change_workers(struct r5conf *conf, int new_cnt)
+{
+	unsigned int old_cnt;
+	struct r5worker *new_workers, *old_workers;
+	struct r5worker *worker;
+	LIST_HEAD(stripes);
+	struct stripe_head *sh;
+	int new_nr_stripes;
+	int i;
+	int ret;
+
+	ret = alloc_workers(conf, new_cnt, &new_workers);
+	if (ret)
+		return ret;
+
+	mutex_lock(&conf->cache_size_mutex);
+
+	old_workers = conf->workers;
+	old_cnt = conf->worker_cnt;
+	new_nr_stripes = new_cnt * conf->worker_min_nr_stripes;
+
+	while (new_nr_stripes > READ_ONCE(conf->max_nr_stripes)) {
+		if (!grow_one_stripe(old_workers, GFP_NOIO)) {
+			mutex_unlock(&conf->cache_size_mutex);
+			kfree(new_workers);
+			return -ENOMEM;
+		}
+	}
+
+	spin_lock_irq(&conf->device_lock);
+	smp_store_release(&conf->quiesce, 2);
+	wait_event_lock_irq(conf->wait_for_quiescent,
+			    atomic_read(&conf->active_stripes) == 0,
+			    conf->device_lock);
+
+	for (i = 0; i < old_cnt; i++) {
+		worker = &old_workers[i];
+
+		while (worker->max_nr_stripes > 0) {
+			worker->max_nr_stripes--;
+			sh = list_first_entry(&conf->inactive_list,
+					      struct stripe_head, lru);
+			list_move(&sh->lru, &stripes);
+			remove_hash(sh);
+		}
+	}
+	spin_unlock_irq(&conf->device_lock);
+
+	for (i = 0; i < new_cnt; i++) {
+		worker = &new_workers[i];
+
+		while (worker->max_nr_stripes < conf->worker_min_nr_stripes) {
+			worker->max_nr_stripes++;
+			sh = list_first_entry(&stripes, struct stripe_head, lru);
+			sh->worker = worker;
+			list_move(&sh->lru, &conf->inactive_list);
+		}
+	}
+
+	WRITE_ONCE(conf->min_nr_stripes, new_nr_stripes);
+	WRITE_ONCE(conf->max_nr_stripes, new_nr_stripes);
+
+	spin_lock_irq(&conf->device_lock);
+	conf->worker_cnt = new_cnt;
+	conf->workers = new_workers;
+	conf->quiesce = 0;
+	wake_up(&conf->wait_for_quiescent);
+	wake_up(&conf->wait_for_reshape);
+	spin_unlock_irq(&conf->device_lock);
+
+	mutex_unlock(&conf->cache_size_mutex);
+
+	while (!list_empty(&stripes)) {
+		sh = list_first_entry(&stripes, struct stripe_head, lru);
+		list_del_init(&sh->lru);
+		shrink_buffers(sh);
+		free_stripe(conf->slab_cache, sh);
+	}
+	kfree(old_workers);
+
+	return 0;
 }
 
 static sector_t
@@ -7060,8 +7167,8 @@ static void free_conf(struct r5conf *conf)
 	log_exit(conf);
 
 	shrinker_free(conf->shrinker);
-	free_workers(conf);
 	shrink_stripes(conf);
+	free_workers(conf);
 	raid5_free_percpu(conf);
 	for (i = 0; i < conf->pool_size; i++)
 		if (conf->disks[i].extra_page)
@@ -7108,17 +7215,23 @@ static unsigned long raid5_cache_scan(struct shrinker *shrink,
 				      struct shrink_control *sc)
 {
 	struct r5conf *conf = shrink->private_data;
+	struct r5worker *worker;
 	unsigned long ret = SHRINK_STOP;
 
 	if (mutex_trylock(&conf->cache_size_mutex)) {
 		ret= 0;
+		worker = conf->workers;
 		while (ret < sc->nr_to_scan &&
 		       conf->max_nr_stripes > conf->min_nr_stripes) {
-			if (drop_one_stripe(conf) == 0) {
-				ret = SHRINK_STOP;
-				break;
+			if (worker->max_nr_stripes > conf->worker_min_nr_stripes) {
+				if (drop_one_stripe(worker) == 0) {
+					ret = SHRINK_STOP;
+					break;
+				}
+			    ret++;
 			}
-			ret++;
+			if (++worker == conf->workers + conf->worker_cnt)
+				worker = conf->workers;
 		}
 		mutex_unlock(&conf->cache_size_mutex);
 	}
@@ -7199,7 +7312,6 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	if (!alloc_workers(conf, 1, &new_workers)) {
 		conf->worker_cnt = 1;
 		conf->workers = new_workers;
-		conf->curr_worker = conf->workers;
 	} else
 		goto abort;
 	spin_lock_init(&conf->device_lock);
@@ -7324,19 +7436,20 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 		conf->prev_algo = conf->algorithm;
 	}
 
-	conf->min_nr_stripes = NR_STRIPES;
+	conf->worker_min_nr_stripes = NR_STRIPES;
 	if (mddev->reshape_position != MaxSector) {
 		int stripes = max_t(int,
 			((mddev->chunk_sectors << 9) / RAID5_STRIPE_SIZE(conf)) * 4,
 			((mddev->new_chunk_sectors << 9) / RAID5_STRIPE_SIZE(conf)) * 4);
-		conf->min_nr_stripes = max(NR_STRIPES, stripes);
-		if (conf->min_nr_stripes != NR_STRIPES)
+		conf->worker_min_nr_stripes = max(NR_STRIPES, stripes);
+		if (conf->worker_min_nr_stripes != NR_STRIPES)
 			pr_info("md/raid:%s: force stripe size %d for reshape\n",
-				mdname(mddev), conf->min_nr_stripes);
+				mdname(mddev), conf->worker_min_nr_stripes);
 	}
+	conf->min_nr_stripes = conf->worker_min_nr_stripes * conf->worker_cnt;
 	memory = conf->min_nr_stripes * (sizeof(struct stripe_head) +
 		 max_disks * ((sizeof(struct bio) + PAGE_SIZE))) / 1024;
-	if (grow_stripes(conf, conf->min_nr_stripes)) {
+	if (grow_stripes(conf)) {
 		pr_warn("md/raid:%s: couldn't allocate %dkB for buffers\n",
 			mdname(mddev), memory);
 		ret = -ENOMEM;

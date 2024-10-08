@@ -201,6 +201,7 @@ struct stripe_head {
 	struct hlist_node	hash;
 	struct list_head	lru;	      /* inactive_list or handle_list */
 	struct llist_node	release_list;
+	struct r5worker		*worker;
 	struct r5conf		*raid_conf;
 	short			generation;	/* increments with every
 						 * reshape */
@@ -494,8 +495,9 @@ struct disk_info {
 #define MAX_STRIPE_BATCH	8
 
 struct r5worker {
-	struct work_struct work;
-	struct r5conf *conf;
+	struct work_struct	work;
+	struct r5conf		*conf;
+	int			max_nr_stripes;
 };
 
 /*
@@ -559,6 +561,7 @@ struct r5conf {
 	int			raid_disks;
 	int			max_nr_stripes;
 	int			min_nr_stripes;
+	int			worker_min_nr_stripes;
 #if PAGE_SIZE != DEFAULT_STRIPE_SIZE
 	unsigned long	stripe_size;
 	unsigned int	stripe_shift;
@@ -657,7 +660,6 @@ struct r5conf {
 	 */
 	struct md_thread __rcu	*thread;
 	struct r5worker		*workers;
-	struct r5worker		*curr_worker;
 	int			worker_cnt;
 	struct r5l_log		*log;
 	void			*log_private;
